@@ -1,0 +1,7 @@
+discord.py
+yt-dlp
+aiomysql
+PyNaCl
+wavelink
+aiohttp
+davey
