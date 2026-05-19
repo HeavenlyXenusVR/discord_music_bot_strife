@@ -3204,8 +3204,8 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
                 )
             ):
                 if not (VOICE_FORCE_STALE_CLIENT_REJOIN or allow_stale_rejoin):
-                    logger.warning(f"[{guild.id}] Voice client looks unstable, but this caller is not allowed to force a disconnect/rejoin; leaving it alone for Aria-managed recovery.")
-                    return voice_client
+                    logger.warning(f"[{guild.id}] Voice client looks unstable and cannot be recycled by this caller; requeueing instead of playing into a stale voice session.")
+                    return None
                 try:
                     await voice_client.disconnect()
                 except Exception:
