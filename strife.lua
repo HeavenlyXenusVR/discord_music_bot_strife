@@ -1235,6 +1235,55 @@ local autodj_enqueue
 -- starts playback. Bad rows (dead links, load failures) are dropped and
 -- the next one is tried, bounded so a run of dead tracks can't recurse
 -- forever. Returns true if something started playing.
+-- Port of alucard.py's update_stage_topic/clear_voice_channel_status: without
+-- this, a stage channel just sits showing "waiting" in Discord's UI and the
+-- member list never shows what's playing, even though audio is flowing fine
+-- -- these are purely cosmetic Discord-side signals, not required for audio,
+-- but users expect them. Channel type is memoized since it never changes.
+local channel_kind_cache = {} -- channel_id -> "stage" | "voice"
+local last_stage_topic = {}   -- guild_id -> last topic string sent (dedup)
+
+local function get_channel_kind(channel_id)
+  if not channel_id then return "voice" end
+  local cached = channel_kind_cache[channel_id]
+  if cached then return cached end
+  local ch = bot.rest:get("/channels/" .. tostring(channel_id))
+  local kind = (ch and ch.type == 13) and "stage" or "voice"
+  channel_kind_cache[channel_id] = kind
+  return kind
+end
+
+local function update_stage_topic(guild_id, channel_id, title)
+  if not channel_id then return end
+  local ok, err = pcall(function()
+    local safe_title = tostring(title or "Unknown Track"):gsub("\n", " "):sub(1, 60)
+    local topic = "\xF0\x9F\x8E\xB5 " .. safe_title
+    if last_stage_topic[guild_id] == topic then return end
+    if get_channel_kind(channel_id) == "stage" then
+      local patched = bot.rest:patch("/stage-instances/" .. tostring(channel_id), { topic = topic })
+      if not patched then
+        bot.rest:post("/stage-instances", { channel_id = tostring(channel_id), topic = topic, privacy_level = 2 })
+      end
+    else
+      bot.rest:patch("/channels/" .. tostring(channel_id), { status = topic })
+    end
+    last_stage_topic[guild_id] = topic
+  end)
+  if not ok then print(("[strife] stage/voice topic update failed for %s: %s"):format(tostring(guild_id), tostring(err))) end
+end
+
+local function clear_stage_topic(guild_id, channel_id)
+  last_stage_topic[guild_id] = nil
+  if not channel_id then return end
+  pcall(function()
+    if get_channel_kind(channel_id) == "stage" then
+      bot.rest:delete("/stage-instances/" .. tostring(channel_id))
+    else
+      bot.rest:patch("/channels/" .. tostring(channel_id), { status = cjson.null })
+    end
+  end)
+end
+
 local function process_queue_impl(guild_id, channel_id, depth)
   depth = depth or 0
   if depth > 5 then return false end
@@ -1258,6 +1307,7 @@ local function process_queue_impl(guild_id, channel_id, depth)
     end
     if not row then
       playback[guild_id] = nil
+      clear_stage_topic(guild_id, channel_id)
       persist_playback_state(guild_id, { is_playing = false, is_paused = false, video_url = PG_NULL, title = PG_NULL, track_uid = PG_NULL })
       return false
     end
@@ -1302,6 +1352,7 @@ local function process_queue_impl(guild_id, channel_id, depth)
 
   local duration = track.info and math.floor((track.info.length or 0) / 1000) or 0
   local title = row.title or (track.info and track.info.title) or "Unknown"
+  update_stage_topic(guild_id, channel_id, title)
   playback[guild_id] = {
     url = row.video_url, title = title, duration = duration, position = 0,
     requester_id = row.requester_id, channel_id = channel_id, track_uid = row.track_uid,
@@ -1347,6 +1398,9 @@ end
 
 local function stop_playback(guild_id)
   bot.lavalink:stop(guild_id)
+  -- home_channel() isn't in scope yet at this point in the file (defined
+  -- further down), so this only clears using the in-memory channel_id.
+  clear_stage_topic(guild_id, playback[guild_id] and playback[guild_id].channel_id)
   playback[guild_id] = nil
   fade_tokens[guild_id] = (fade_tokens[guild_id] or 0) + 1 -- cancel any in-flight fade-in
   persist_playback_state(guild_id, { is_playing = false, is_paused = false, video_url = PG_NULL, title = PG_NULL, track_uid = PG_NULL })
@@ -2989,6 +3043,26 @@ end)
 
 bot.gateway:on("READY", function()
   send_webhook_log("\240\159\159\162 Node Online", "STRIFE is online and syncing with the swarm.", COLOR.green)
+  -- Rejoin and resume for any guild that was playing (or had a non-empty
+  -- queue) when this process last stopped -- container recreates/restarts
+  -- otherwise leave the bot sitting disconnected with a full queue and no
+  -- way back in short of a manual /play.
+  copas.addthread(function()
+    copas.sleep(2) -- let the gateway session settle before opening voice
+    local rows = db("SELECT DISTINCT guild_id FROM strife_bot_home_channels WHERE bot_name = 'strife'") or {}
+    for _, row in ipairs(rows) do
+      local gid = row.guild_id
+      local channel_id = home_channel(gid)
+      if channel_id then
+        local has_queue = queue_count(gid) > 0
+        local was_playing = db1("SELECT is_playing FROM strife_playback_state WHERE guild_id = %s AND bot_name = 'strife'", gid)
+        if has_queue or (was_playing and was_playing.is_playing) then
+          print(("[strife] [%s] resuming on boot (queue=%s, was_playing=%s)"):format(tostring(gid), tostring(has_queue), tostring(was_playing and was_playing.is_playing)))
+          process_queue(gid, channel_id)
+        end
+      end
+    end
+  end)
 end)
 
 bootstrap_schema()
