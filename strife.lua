@@ -546,10 +546,30 @@ local function has_perm(perm_str, flag)
 end
 local PERM_ADMINISTRATOR = 0x8
 
+local guild_owner_cache = {} -- guild_id -> owner user_id
+
+local function get_guild_owner_id(guild_id)
+  if not guild_id then return nil end
+  local cached = guild_owner_cache[guild_id]
+  if cached then return cached end
+  local g = bot.rest:get("/guilds/" .. tostring(guild_id))
+  local owner_id = g and g.owner_id
+  if owner_id then guild_owner_cache[guild_id] = owner_id end
+  return owner_id
+end
+
 local function is_admin(interaction)
   local member = interaction.member
-  if not member or not member.permissions then return false end
-  return has_perm(member.permissions, PERM_ADMINISTRATOR)
+  if member and member.permissions and has_perm(member.permissions, PERM_ADMINISTRATOR) then
+    return true
+  end
+  -- The guild owner always effectively has admin, but Discord's resolved
+  -- member.permissions bitfield on the interaction has been observed to not
+  -- reliably reflect that -- fall back to an explicit ownership check
+  -- rather than ever locking the actual owner out of admin-gated commands.
+  local uid = member and member.user and member.user.id
+  local owner_id = uid and get_guild_owner_id(interaction.guild_id)
+  return owner_id ~= nil and tostring(owner_id) == tostring(uid)
 end
 
 -- =====================================================================
