@@ -1005,6 +1005,254 @@ local function restore_queue_from_backup(guild_id)
   return #rows
 end
 
+-- ===========================================================================
+-- Live playlist sync: auto-add newly appeared tracks / auto-remove tracks
+-- gone from a queued playlist's source. Ported from alucard.py's
+-- playlist_sync_loop -- this was cut fleet-wide during the Lua rewrite
+-- (strife_active_playlists existed only as inert per-guild metadata,
+-- written to by nothing but the DELETE calls scattered through /stop,
+-- /clear, sleep-timer-elapsed, and queue-drained; is_playlist_source() was
+-- defined but never called). Simplified vs. the Python original: no
+-- YouTube Data API path (this stack only has Lavalink), so every
+-- re-extraction is treated as equally trustworthy and a removal always
+-- requires 2 consecutive missing cycles rather than distinguishing an
+-- "API-trusted" cycle from a truncating-fallback one.
+-- ===========================================================================
+
+local PLAYLIST_SYNC_INTERVAL = tonumber(env("PLAYLIST_SYNC_INTERVAL", "30")) or 30
+local PLAYLIST_SYNC_MAX_TRACKED = tonumber(env("PLAYLIST_SYNC_MAX_TRACKED", "500")) or 500
+local PLAYLIST_QUEUE_MIN_TRACKS = tonumber(env("PLAYLIST_QUEUE_MIN_TRACKS", "20")) or 20
+local playlist_missing_streak = {} -- guild_id -> {track_key -> consecutive cycles missing}
+
+-- This file's only other trim() isn't defined until much later (an
+-- autocomplete handler near the bottom) -- too late to be in scope here.
+-- Local copy, scoped to this block only.
+local function trim(s) return tostring(s or ""):match("^%s*(.-)%s*$") end
+
+local function clear_active_playlist(guild_id)
+  db("DELETE FROM strife_active_playlists WHERE guild_id = %s AND bot_name = 'strife'", guild_id)
+  db("DELETE FROM strife_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'strife'", guild_id)
+  playlist_missing_streak[guild_id] = nil
+end
+
+-- track_key() itself caps at 64 chars (matches strife_track_intelligence's
+-- url_key VARCHAR(64)), but strife_active_playlist_tracks.track_key is a
+-- pre-existing CHAR(40) column -- overflowing it fails the INSERT, and
+-- since that happened on every row of every playlist sync, it also tripped
+-- the pg.lua reconnect-storm bug fixed above (same failure, same query, in
+-- a loop). CHAR (not VARCHAR) also blank-pads on read, so values coming
+-- back out of this column need trimming before comparing them against a
+-- freshly computed key.
+local function playlist_track_key(url, title)
+  local k = track_key(url, title)
+  if #k > 40 then k = k:sub(1, 40) end
+  return k
+end
+
+-- Called right after a /play (or equivalent) call resolves to a real
+-- Lavalink loadType=playlist response -- registers it so playlist_sync_tick
+-- starts watching it for adds/removals.
+local function set_active_playlist(guild_id, playlist_url, entries, requester_id, channel_id)
+  if not playlist_url or not entries or #entries == 0 then return end
+  db([[INSERT INTO strife_active_playlists (guild_id, bot_name, playlist_url, known_track_count, requester_id, channel_id)
+      VALUES (%s, 'strife', %s, %s, %s, %s)
+      ON CONFLICT (guild_id, bot_name) DO UPDATE SET playlist_url = EXCLUDED.playlist_url,
+        known_track_count = EXCLUDED.known_track_count, requester_id = EXCLUDED.requester_id, channel_id = EXCLUDED.channel_id]],
+    guild_id, playlist_url, math.min(#entries, PLAYLIST_SYNC_MAX_TRACKED), requester_id, channel_id)
+  db("DELETE FROM strife_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'strife'", guild_id)
+  for idx, t in ipairs(entries) do
+    if idx > PLAYLIST_SYNC_MAX_TRACKED then break end
+    db([[INSERT INTO strife_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+        VALUES (%s, 'strife', %s, %s, %s, %s, %s, %s, %s)]],
+      guild_id, playlist_url, idx - 1, playlist_track_key(t.uri, t.title), new_track_uid(), t.uri, t.title, requester_id)
+  end
+  playlist_missing_streak[guild_id] = nil
+end
+
+-- One sync cycle across every guild with a registered active playlist:
+-- re-extracts each playlist via Lavalink, multiset-diffs it against the
+-- last-known snapshot (strife_active_playlist_tracks), enqueues additions,
+-- and removes tracks that have been missing for 2 consecutive cycles
+-- (from both the live queue and its backup mirror) -- plus a loop-mode
+-- duplicate trim and a queue-health refill, matching the Python original.
+local function playlist_sync_tick()
+  local playlists = db("SELECT guild_id, playlist_url, known_track_count, requester_id, channel_id FROM strife_active_playlists WHERE bot_name = 'strife'") or {}
+  for _, prow in ipairs(playlists) do
+    local gid = prow.guild_id
+    local ok, err = pcall(function()
+      local result, lerr = bot.lavalink:load_tracks(prow.playlist_url)
+      if not result or result.loadType == "error" or result.loadType == "empty" then
+        log_warn("[%s] playlist sync: re-extract failed: %s", gid, tostring((result and result.data and result.data.message) or lerr or "no response"))
+        return
+      end
+      local raw_entries = (result.loadType == "playlist") and ((result.data and result.data.tracks) or {}) or {}
+      local entries = {}
+      for _, t in ipairs(raw_entries) do
+        if t.info and t.info.uri then entries[#entries + 1] = { uri = t.info.uri, title = t.info.title } end
+      end
+      if #entries == 0 then
+        log_warn("[%s] playlist sync: re-extract returned no tracks", gid)
+        return
+      end
+      if #entries > PLAYLIST_SYNC_MAX_TRACKED then
+        local trimmed = {}
+        for i = 1, PLAYLIST_SYNC_MAX_TRACKED do trimmed[i] = entries[i] end
+        entries = trimmed
+      end
+
+      local current_rows = {}
+      local current_counts = {}
+      for _, t in ipairs(entries) do
+        local k = playlist_track_key(t.uri, t.title)
+        current_rows[#current_rows + 1] = { url = t.uri, title = t.title, key = k }
+        current_counts[k] = (current_counts[k] or 0) + 1
+      end
+
+      local previous_rows = db("SELECT track_key, track_uid, video_url, title, requester_id FROM strife_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'strife' ORDER BY position_idx ASC", gid) or {}
+      local previous_by_key = {}
+      local remaining_previous = {}
+      for _, p in ipairs(previous_rows) do
+        local k = trim(p.track_key or "")
+        previous_by_key[k] = previous_by_key[k] or {}
+        table.insert(previous_by_key[k], p)
+        remaining_previous[k] = (remaining_previous[k] or 0) + 1
+      end
+
+      local added_rows = {}
+      for _, r in ipairs(current_rows) do
+        if remaining_previous[r.key] and remaining_previous[r.key] > 0 then
+          remaining_previous[r.key] = remaining_previous[r.key] - 1
+        else
+          added_rows[#added_rows + 1] = r
+        end
+      end
+
+      local removed_counts = {}
+      local carry_forward = {}
+      local streaks = playlist_missing_streak[gid] or {}
+      for k, missing_n in pairs(remaining_previous) do
+        if missing_n > 0 then
+          local streak = (streaks[k] or 0) + 1
+          streaks[k] = streak
+          if streak >= 2 then
+            removed_counts[k] = missing_n
+          else
+            for i = 1, missing_n do
+              local p = previous_by_key[k] and previous_by_key[k][i]
+              if p then carry_forward[#carry_forward + 1] = p end
+            end
+          end
+        end
+      end
+      for k in pairs(current_counts) do streaks[k] = nil end
+      playlist_missing_streak[gid] = next(streaks) and streaks or nil
+
+      local purged_live, purged_backup = 0, 0
+      if next(removed_counts) ~= nil then
+        local budget = {}
+        for k, c in pairs(removed_counts) do budget[k] = c end
+        local live_rows = db("SELECT id, video_url, title FROM strife_queue WHERE guild_id = %s AND bot_name = 'strife' ORDER BY id ASC", gid) or {}
+        for _, lr in ipairs(live_rows) do
+          local k = playlist_track_key(lr.video_url, lr.title)
+          if budget[k] and budget[k] > 0 then
+            budget[k] = budget[k] - 1
+            db("DELETE FROM strife_queue WHERE id = %s AND guild_id = %s AND bot_name = 'strife'", lr.id, gid)
+            purged_live = purged_live + 1
+          end
+        end
+        budget = {}
+        for k, c in pairs(removed_counts) do budget[k] = c end
+        local backup_rows = db("SELECT id, video_url, title FROM strife_queue_backup WHERE guild_id = %s AND bot_name = 'strife' ORDER BY id ASC", gid) or {}
+        for _, br in ipairs(backup_rows) do
+          local k = playlist_track_key(br.video_url, br.title)
+          if budget[k] and budget[k] > 0 then
+            budget[k] = budget[k] - 1
+            db("DELETE FROM strife_queue_backup WHERE id = %s AND guild_id = %s AND bot_name = 'strife'", br.id, gid)
+            purged_backup = purged_backup + 1
+          end
+        end
+      end
+
+      if #added_rows > 0 then
+        for _, r in ipairs(added_rows) do enqueue_track(gid, r.url, r.title, prow.requester_id) end
+        snapshot_queue_backup(gid)
+        if #added_rows > 1 then shuffle_queue_rows(gid, true) end
+      end
+
+      -- Trim loop-mode duplicate live-queue copies down to at most 1 per track_key still in the playlist.
+      local trim_count = 0
+      local current_keys = {}
+      for _, r in ipairs(current_rows) do current_keys[r.key] = true end
+      local all_rows = db("SELECT id, video_url, title FROM strife_queue WHERE guild_id = %s AND bot_name = 'strife' ORDER BY id ASC", gid) or {}
+      local seen = {}
+      for _, qr in ipairs(all_rows) do
+        local k = playlist_track_key(qr.video_url, qr.title)
+        if current_keys[k] then
+          if seen[k] then
+            db("DELETE FROM strife_queue WHERE id = %s AND guild_id = %s AND bot_name = 'strife'", qr.id, gid)
+            trim_count = trim_count + 1
+          else
+            seen[k] = true
+          end
+        end
+      end
+
+      -- Queue-health refill: independent of the diff above, top the live queue back up
+      -- if it's thinner than expected relative to the tracked playlist (drained by
+      -- playback/a bug/a restart without the source playlist itself changing).
+      local refilled = 0
+      local queued_rows = db("SELECT video_url, title FROM strife_queue WHERE guild_id = %s AND bot_name = 'strife'", gid) or {}
+      local queued_keys = {}
+      local queued_n = 0
+      for _, qr in ipairs(queued_rows) do
+        local k = playlist_track_key(qr.video_url, qr.title)
+        if not queued_keys[k] then queued_keys[k] = true; queued_n = queued_n + 1 end
+      end
+      local target = math.min(#current_rows, PLAYLIST_QUEUE_MIN_TRACKS)
+      if queued_n < target then
+        local refill_rows = {}
+        for _, r in ipairs(current_rows) do
+          if queued_n + #refill_rows >= target then break end
+          if not queued_keys[r.key] then refill_rows[#refill_rows + 1] = r end
+        end
+        for _, r in ipairs(refill_rows) do enqueue_track(gid, r.url, r.title, prow.requester_id) end
+        if #refill_rows > 0 then
+          refilled = #refill_rows
+          snapshot_queue_backup(gid)
+          shuffle_queue_rows(gid, true)
+        end
+      end
+
+      if #added_rows > 0 or purged_live > 0 or purged_backup > 0 or trim_count > 0 or refilled > 0 then
+        log_info("[%s] playlist sync: +%d -%d(live) -%d(backup) trimmed=%d refilled=%d", gid, #added_rows, purged_live, purged_backup, trim_count, refilled)
+      end
+
+      -- Persist this cycle's confirmed tracks plus anything still in its missing-streak
+      -- grace window as the baseline the next cycle diffs against.
+      db("DELETE FROM strife_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'strife'", gid)
+      local idx = 0
+      for _, r in ipairs(current_rows) do
+        db([[INSERT INTO strife_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+            VALUES (%s, 'strife', %s, %s, %s, %s, %s, %s, %s)]],
+          gid, prow.playlist_url, idx, r.key, new_track_uid(), r.url, r.title, prow.requester_id)
+        idx = idx + 1
+      end
+      for _, p in ipairs(carry_forward) do
+        db([[INSERT INTO strife_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+            VALUES (%s, 'strife', %s, %s, %s, %s, %s, %s, %s)]],
+          gid, prow.playlist_url, idx, trim(p.track_key or ""), trim(p.track_uid or "") ~= "" and trim(p.track_uid) or new_track_uid(), p.video_url, p.title, p.requester_id)
+        idx = idx + 1
+      end
+      db("UPDATE strife_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'strife'", idx, gid)
+    end)
+    if not ok then
+      log_warn("[%s] playlist sync tick error: %s", gid, tostring(err))
+      report_error(gid, "runtime", "playlist sync error", tostring(err))
+    end
+  end
+end
+
+
 -- =====================================================================
 -- LAVALINK TRACK RESOLUTION
 -- =====================================================================
@@ -1013,6 +1261,15 @@ local function is_explicit_query(value)
   value = tostring(value or ""):lower()
   if value:match("^https?://") then return true end
   return value:match("^[a-z0-9_]+search:") ~= nil
+end
+
+-- Ported alongside alucard.lua/lockhart.lua/etc's copy for playlist_sync_tick below.
+local function is_playlist_source(v)
+  v = tostring(v or "")
+  if not v:match("^https?://") then return false end
+  if v:match("[?&]list=") then return true end
+  local lowered = v:lower()
+  return lowered:find("/playlist", 1, true) ~= nil or lowered:find("/sets/", 1, true) ~= nil
 end
 
 -- Resolves a search string / URL into one or more Lavalink track objects
@@ -1740,6 +1997,17 @@ local function start_background_loops()
     end
   end)
 
+  copas.addthread(function()
+    while true do
+      copas.sleep(PLAYLIST_SYNC_INTERVAL)
+      local ok, err = pcall(playlist_sync_tick)
+      if not ok then
+        print("[strife] playlist sync tick error: " .. tostring(err))
+        report_error(nil, "runtime", "playlist sync tick error", tostring(err))
+      end
+    end
+  end)
+
   -- SwarmPanel/Aria remote-control bridge -- was entirely missing (the
   -- swarm_overrides table only existed via a CREATE TABLE/comment, nothing
   -- ever polled it), so the panel's PAUSE/RESUME/SKIP/STOP/RESTART buttons
@@ -1840,6 +2108,57 @@ local function home_channel(guild_id)
   return row and row.home_vc_id or nil
 end
 
+-- SwarmPanel's control.lua writes uppercase PLAY/RECOVER/LEAVE/SEEK rows into
+-- strife_swarm_direct_orders for source_url plays, fleet-supervisor recovery,
+-- forced disconnects, and seek-to-position -- none of the simpler overrides
+-- poller (above, in start_background_loops) covers these. Defined here
+-- rather than alongside that poller since it needs home_channel(), which
+-- isn't declared until after that function's body was already parsed.
+local function handle_direct_order(order)
+  local guild_id = tostring(order.guild_id)
+  local cmd = order.command
+  local ok, err = pcall(function()
+    if cmd == "PLAY" and order.data and order.vc_id and order.vc_id ~= "0" then
+      local entries, terr = resolve_playables(order.data)
+      if not entries or #entries == 0 then error("could not resolve source: " .. tostring(terr), 0) end
+      for _, t in ipairs(entries) do
+        enqueue_track(guild_id, t.info.uri, t.info.title, nil)
+      end
+      if #entries > 1 then shuffle_queue_rows(guild_id, true) end
+      if not playback[guild_id] then process_queue(guild_id, order.vc_id) end
+    elseif cmd == "RECOVER" then
+      local channel_id = (order.vc_id and order.vc_id ~= "0" and order.vc_id) or home_channel(guild_id)
+      if channel_id and not playback[guild_id] then process_queue(guild_id, channel_id) end
+    elseif cmd == "LEAVE" then
+      stop_playback(guild_id)
+      disconnect_voice(guild_id)
+    elseif cmd == "SEEK" and order.data then
+      local target_seconds = math.max(0, tonumber(order.data) or 0)
+      local data = playback[guild_id]
+      if data then
+        bot.lavalink:seek(guild_id, target_seconds * 1000)
+        data.position = target_seconds
+        data.updated_at = os.time()
+        persist_playback_state(guild_id, { position_seconds = target_seconds })
+      end
+    end
+  end)
+  if not ok then
+    db("UPDATE strife_swarm_direct_orders SET attempts = attempts + 1, last_error = %s WHERE id = %s", tostring(err):sub(1, 500), order.id)
+  else
+    db("DELETE FROM strife_swarm_direct_orders WHERE id = %s", order.id)
+    send_webhook_log("\240\159\164\150 Aria Direct Order", ("Aria executed **%s** in guild %s."):format(cmd, guild_id), COLOR.purple)
+  end
+end
+
+local function poll_direct_orders()
+  local rows = db("SELECT id, guild_id, vc_id, text_channel_id, command, data FROM strife_swarm_direct_orders WHERE bot_name = 'strife' AND claimed_at IS NULL ORDER BY id ASC LIMIT 5") or {}
+  for _, order in ipairs(rows) do
+    db("UPDATE strife_swarm_direct_orders SET claimed_at = NOW() WHERE id = %s", order.id)
+    handle_direct_order(order)
+  end
+end
+
 local function resolve_join_channel(interaction)
   return home_channel(interaction.guild_id) or user_voice_channel(interaction.guild_id, interaction.member.user.id)
 end
@@ -1882,6 +2201,13 @@ bot:command("strife_main_play", {
     enqueue_track(guild_id, uri, title, requester_id, new_track_uid())
   end
   if #entries > 1 then shuffle_queue_rows(guild_id, true) end
+  if playlist and is_playlist_source(search) then
+    local norm = {}
+    for _, t in ipairs(entries) do
+      if t.info and t.info.uri then norm[#norm + 1] = { uri = t.info.uri, title = t.info.title } end
+    end
+    set_active_playlist(guild_id, search, norm, requester_id, channel_id)
+  end
   local total = queue_count(guild_id)
 
   local was_idle = playback[guild_id] == nil
@@ -1930,7 +2256,7 @@ function(self, interaction)
   cancel_sleep_timer(guild_id)
   stop_playback(guild_id)
   db("DELETE FROM strife_queue WHERE guild_id = %s AND bot_name = 'strife'", guild_id)
-  db("DELETE FROM strife_active_playlists WHERE guild_id = %s AND bot_name = 'strife'", guild_id)
+  clear_active_playlist(guild_id)
   reply_embed(interaction, embed({ title = "\226\143\185 Stopped", description = "Sheathing the Buster Sword. Music stopped and queue cleared.", color = COLOR.red }), true)
 end)
 
@@ -2227,7 +2553,7 @@ function(self, interaction)
   playback[guild_id] = nil
   db("DELETE FROM strife_queue WHERE guild_id = %s AND bot_name = 'strife'", guild_id)
   db("DELETE FROM strife_queue_backup WHERE guild_id = %s AND bot_name = 'strife'", guild_id)
-  db("DELETE FROM strife_active_playlists WHERE guild_id = %s AND bot_name = 'strife'", guild_id)
+  clear_active_playlist(guild_id)
   persist_playback_state(guild_id, { is_playing = false, is_paused = false, video_url = PG_NULL, title = PG_NULL, position_seconds = 0, track_uid = PG_NULL })
   reply_embed(interaction, embed({ description = "\240\159\151\145\239\184\143 Playback stopped and queue cleared.", color = COLOR.red }), true)
 end)
@@ -3241,6 +3567,18 @@ elseif env("STRIFE_DRY_RUN") then
 end
 
 start_background_loops()
+
+copas.addthread(function()
+  while true do
+    copas.sleep(5)
+    local ok, err = pcall(poll_direct_orders)
+    if not ok then
+      print("[strife] direct order poll error: " .. tostring(err))
+      report_error(nil, "runtime", "direct order poll error", tostring(err))
+    end
+  end
+end)
+
 print(("[strife] booting -- %d commands registered, Lavalink at %s:%d"):format(command_count(), LAVALINK_HOST, LAVALINK_PORT))
 
 bot:run()
