@@ -1465,10 +1465,26 @@ local function mark_voice_disconnected(guild_id)
 end
 
 local function connect_voice(guild_id, channel_id)
-  if voice_channel[guild_id] == channel_id then return end
+  -- Used to key off voice_channel[guild_id] (a local "we already called
+  -- join" cache) and return immediately once it matched, with no wait for
+  -- VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE and no way for callers to know
+  -- whether a live voice link actually exists -- a stale cache entry (or a
+  -- link that died) meant this silently did nothing on every subsequent
+  -- call, and update_player() was never checked either, so a dead voice
+  -- link looked identical to a working one.
+  if voice_channel[guild_id] == channel_id
+      and bot.voice_state[guild_id] and bot.voice_state[guild_id].session_id then
+    return true
+  end
   bot.gateway:join_voice(guild_id, channel_id, false, true) -- self-deafened, matches strife.py's ensure_self_deaf
   voice_channel[guild_id] = channel_id
   mark_voice_connected(guild_id, channel_id)
+  local waited = 0
+  while waited < 8 and not (bot.voice_state[guild_id] and bot.voice_state[guild_id].session_id) do
+    copas.sleep(0.25)
+    waited = waited + 0.25
+  end
+  return bot.voice_state[guild_id] and bot.voice_state[guild_id].session_id ~= nil
 end
 
 local function disconnect_voice(guild_id)
@@ -1630,7 +1646,10 @@ local function process_queue_impl(guild_id, channel_id, depth)
     -- and the next natural trigger will retry once it's back.
     return false
   end
-  connect_voice(guild_id, channel_id)
+  if not connect_voice(guild_id, channel_id) then
+    print(("[strife] [%s] Voice connection unavailable; leaving queue untouched"):format(tostring(guild_id)))
+    return false
+  end
 
   local row = db1("SELECT id, video_url, title, requester_id, track_uid FROM strife_queue WHERE guild_id = %s AND bot_name = 'strife' ORDER BY id ASC LIMIT 1", guild_id)
   if not row then
@@ -1698,11 +1717,16 @@ local function process_queue_impl(guild_id, channel_id, depth)
   local target_volume = settings.volume or 100
   local use_fade = settings.transition_mode == "fade" or settings.transition_mode == "smart" or settings.transition_mode == "mix"
 
-  bot.lavalink:update_player(guild_id, {
+  local play_ok, play_err = bot.lavalink:update_player(guild_id, {
     encodedTrack = track.encoded,
     volume = use_fade and 0 or target_volume,
     filters = filters,
   })
+  if not play_ok then
+    print(("[strife] [%s] Playback start failed for '%s': %s"):format(tostring(guild_id), tostring(row.title), tostring(play_err)))
+    insert_queue_front(guild_id, row.video_url, row.title, row.requester_id, row.track_uid)
+    return false
+  end
 
   local duration = track.info and math.floor((track.info.length or 0) / 1000) or 0
   local title = row.title or (track.info and track.info.title) or "Unknown"
@@ -2115,7 +2139,14 @@ local function start_background_loops()
           if executed then
             send_webhook_log("\240\159\164\150 Aria Override", ("Aria executed **%s** in guild %s."):format(cmd_name, guild_id), COLOR.purple)
           end
-          db("DELETE FROM strife_swarm_overrides WHERE guild_id = %s AND bot_name = 'strife' AND command = %s", guild_id, row.command)
+          -- Only clear the override once it actually ran -- it used to be
+          -- deleted unconditionally, so a command whose guard didn't match yet
+          -- (e.g. PAUSE arriving before playback[guild_id] was populated, a real
+          -- race right after a container restart) was silently dropped forever
+          -- instead of being retried on the next poll.
+          if executed then
+            db("DELETE FROM strife_swarm_overrides WHERE guild_id = %s AND bot_name = 'strife' AND command = %s", guild_id, row.command)
+          end
         end
       end)
       if not ok then
