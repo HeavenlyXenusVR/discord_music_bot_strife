@@ -1613,9 +1613,23 @@ local function clear_stage_topic(guild_id, channel_id)
   end)
 end
 
+-- guild_id..":"..track_uid -> consecutive resolve-failure count. A Lavalink/
+-- network blip mid-drain used to permanently delete every remaining queued
+-- track (each dequeued row was gone before resolve_playables even ran, and
+-- a failed resolve just deleted it -- backup copy included -- and moved to
+-- the next row), so a short outage could wipe an entire queue in seconds.
+local resolve_attempts = {}
+local MAX_RESOLVE_ATTEMPTS = 3
+
 local function process_queue_impl(guild_id, channel_id, depth)
   depth = depth or 0
   if depth > 5 then return false end
+  if not (bot.lavalink and bot.lavalink.session_id) then
+    -- Lavalink isn't connected right now -- leave the queue untouched
+    -- rather than dequeuing tracks we can't resolve; the watchdog thread
+    -- and the next natural trigger will retry once it's back.
+    return false
+  end
   connect_voice(guild_id, channel_id)
 
   local row = db1("SELECT id, video_url, title, requester_id, track_uid FROM strife_queue WHERE guild_id = %s AND bot_name = 'strife' ORDER BY id ASC LIMIT 1", guild_id)
@@ -1642,13 +1656,24 @@ local function process_queue_impl(guild_id, channel_id, depth)
     end
   end
 
+  local retry_key = guild_id .. ":" .. tostring(row.track_uid or row.video_url)
   local entries, err = resolve_playables(row.video_url)
   if not entries or #entries == 0 then
-    print(("[strife] queue track failed to resolve (%s): %s"):format(tostring(row.video_url), tostring(err)))
+    local attempts = (resolve_attempts[retry_key] or 0) + 1
     db("DELETE FROM strife_queue WHERE id = %s", row.id)
+    if attempts < MAX_RESOLVE_ATTEMPTS then
+      resolve_attempts[retry_key] = attempts
+      print(("[strife] resolve failed for '%s' (attempt %d/%d): %s -- requeuing"):format(tostring(row.video_url), attempts, MAX_RESOLVE_ATTEMPTS, tostring(err)))
+      insert_queue_front(guild_id, row.video_url, row.title, row.requester_id, row.track_uid)
+      return false
+    end
+    resolve_attempts[retry_key] = nil
+    print(("[strife] giving up on '%s' after %d failed resolves: %s"):format(tostring(row.video_url), attempts, tostring(err)))
+    report_error(guild_id, "runtime", "track resolve failed permanently", ("%s: %s"):format(tostring(row.video_url), tostring(err)))
     delete_backup_track(guild_id, row.track_uid, row.video_url, row.title)
     return process_queue_impl(guild_id, channel_id, depth + 1)
   end
+  resolve_attempts[retry_key] = nil
   local track = entries[1]
 
   db("DELETE FROM strife_queue WHERE id = %s", row.id)
@@ -1947,6 +1972,28 @@ bot.lavalink:on("event", function(msg)
     print(("[strife] track exception in guild %s: %s"):format(tostring(guild_id), tostring(msg.exception and msg.exception.message)))
   elseif msg.type == "WebSocketClosedEvent" then
     print(("[strife] Discord voice websocket closed for guild %s (code %s)"):format(tostring(guild_id), tostring(msg.code)))
+    -- Lavalink's own link to Discord's voice server died -- distinct from
+    -- our own gateway seeing a disconnect, and previously handled with a
+    -- log line and nothing else, silently ending playback. Only recover if
+    -- we still think we're actively playing (a deliberate stop/leave
+    -- already cleared `data` here).
+    local data = playback[guild_id]
+    local channel_id = (data and data.channel_id) or voice_channel[guild_id]
+    if data and channel_id then
+      local url, title, requester_id, track_uid = data.url, data.title, data.requester_id, data.track_uid
+      copas.addthread(function()
+        copas.sleep(2)
+        connect_voice(guild_id, channel_id)
+        -- The track that was playing was already dequeued before it
+        -- started, so it isn't sitting in strife_queue to be picked back up
+        -- -- put it back at the front (restarts from the beginning, not the
+        -- exact position, but that's a much smaller loss than the track
+        -- vanishing outright).
+        if url then insert_queue_front(guild_id, url, title, requester_id, track_uid) end
+        playback[guild_id] = nil
+        process_queue(guild_id, channel_id)
+      end)
+    end
   end
 end)
 
@@ -3575,6 +3622,28 @@ copas.addthread(function()
     if not ok then
       print("[strife] direct order poll error: " .. tostring(err))
       report_error(nil, "runtime", "direct order poll error", tostring(err))
+    end
+  end
+end)
+
+local function recovery_watchdog()
+  local stalled = db("SELECT DISTINCT guild_id FROM strife_queue WHERE bot_name = 'strife'") or {}
+  for _, row in ipairs(stalled) do
+    local guild_id = tostring(row.guild_id)
+    if not playback[guild_id] then
+      local channel_id = voice_channel[guild_id] or home_channel(guild_id)
+      if channel_id then process_queue(guild_id, channel_id) end
+    end
+  end
+end
+
+copas.addthread(function()
+  while true do
+    copas.sleep(30)
+    local ok, err = pcall(recovery_watchdog)
+    if not ok then
+      print("[strife] recovery_watchdog error: " .. tostring(err))
+      report_error(nil, "runtime", "recovery_watchdog error", tostring(err))
     end
   end
 end)
